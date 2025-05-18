@@ -38,7 +38,7 @@ SetWorkingDir %A_ScriptDir%  ; Ensures a consistent starting directory.
 ; ==============================================
 
 #SingleInstance force
-Persistent
+#Persistent
 SetBatchLines, -1
 ListLines, Off
 DetectHiddenWindows, On ; Make this persistent for the script
@@ -60,7 +60,8 @@ _InitVDM() {
         ; IID_IVirtualDesktopManager = {A5CD92FF-29BE-454C-8D04-D82879FB3F1B}
         __VDM_MANAGER := ComObjCreate("{AA509086-5CA9-4C25-8F95-589D3C07B48A}", "{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}")
     } catch e {
-        OutputDebug, Failed to initialize Virtual Desktop Manager: % e.Message ? e.Message : "Unknown error"
+        local errorMsg := e.Message ? e.Message : "Unknown error"
+        OutputDebug, Failed to initialize Virtual Desktop Manager: %errorMsg%
         __VDM_MANAGER := "" ; Reset on failure to ensure it's not a stale/invalid object
     }
     return __VDM_MANAGER
@@ -77,7 +78,8 @@ VD_IsWindowOnCurrentDesktop(hWnd) {
         isOnCurrentDesktop := ivdm.IsWindowOnCurrentVirtualDesktop(hWnd)
         return isOnCurrentDesktop
     } catch e {
-        OutputDebug, VD_IsWindowOnCurrentDesktop Error for hWnd %hWnd%: % e.Message ? e.Message : "Unknown error"
+        local errorMsg := e.Message ? e.Message : "Unknown error"
+        OutputDebug, VD_IsWindowOnCurrentDesktop Error for hWnd %hWnd%: %errorMsg%
         ; Fallback on error for a specific window check: assume it is on current desktop
         ; to avoid incorrectly excluding it due to a transient COM error.
         return true 
@@ -534,7 +536,8 @@ DllCall( "TileWindows", uInt,0, Int,0, Int,0, Int,0, Int,0 )
 return
 
 CascadeWindows:
-DllCall( "CascadeWindows", uInt,0, Int,4, Int,0, Int,0, Int,0 )
+    ;DllCall( "CascadeWindows", uInt,0, Int,4, Int,0, Int,0, Int,0 ) ; Original OS-level cascade
+    CascadeWindows_Function() ; Call the new custom, virtual-desktop-aware function
 return
 
 ; ==============================
@@ -957,8 +960,11 @@ IsFullscreen(hwnd) {
 }
 
 CascadeWindows_Function(customParams="") {
-    global MonitorCount, PrimaryMonitor, MonitorPrimary, WorkArea, TaskbarHeight, Margin, PaddingBetweenWindows, MaximizeOverTaskbar
+    global Margin ; Assume Margin is set globally (e.g., 0 or from INI) or default it
     
+    if (Margin = "") ; Default Margin if not set (e.g. to 0 or a sensible default like 10)
+        Margin := 0 
+
     ; Get windows on current virtual desktop, including minimized ones (excludeMinimized = false)
     windowsToCascade := GetTargetWindows("all", "", false, true) 
 
@@ -970,11 +976,13 @@ CascadeWindows_Function(customParams="") {
 
     numWindows := windowsToCascade.Length()
     
-    currentMonitor := GetCurrentMonitor()
-    monLeft := WorkArea[currentMonitor].Left + Margin
-    monTop := WorkArea[currentMonitor].Top + Margin
-    monRight := WorkArea[currentMonitor].Right - Margin
-    monBottom := WorkArea[currentMonitor].Bottom - Margin
+    currentMonitorIdx := GetWindowNumber() ; Get monitor of the active window using existing function
+    SysGet, Mon, MonitorWorkArea, %currentMonitorIdx% ; Get work area for this monitor
+    
+    monLeft := MonLeft + Margin
+    monTop := MonTop + Margin
+    monRight := MonRight - Margin
+    monBottom := MonBottom - Margin
     
     monWidth := monRight - monLeft
     monHeight := monBottom - monTop

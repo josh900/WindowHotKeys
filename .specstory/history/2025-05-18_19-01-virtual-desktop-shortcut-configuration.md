@@ -14,6 +14,270 @@ _**Assistant**_
 
 ---
 
+Okay, I can help you modify the `Move and Resize Hotkeys.ahk` script so that actions like `CascadeWindows` only affect windows on the current virtual desktop.
+
+Here's the plan:
+
+1.  **Add Helper Functions for Virtual Desktops**: We'll add two new functions to your script:
+    *   `_InitVDM()`: Initializes the COM object needed to interact with Windows' virtual desktop manager.
+    *   `VD_IsWindowOnCurrentDesktop(hWnd)`: Checks if a given window (identified by its handle `hWnd`) is on the currently active virtual desktop.
+
+2.  **Modify `GetTargetWindows` Function**: This existing function is responsible for gathering a list of windows to act upon. We'll enhance it:
+    *   Add a new parameter `filterByCurrentVD` (defaulting to `false`).
+    *   If `filterByCurrentVD` is `true`, it will use `VD_IsWindowOnCurrentDesktop` to include only windows from the current virtual desktop.
+    *   We'll also consolidate and slightly enhance its general window filtering logic, incorporating some more specific filters previously found only in `CascadeWindows_Function` to make it more robust for identifying "main application windows."
+
+3.  **Update `CascadeWindows_Function`**: This function will be updated to:
+    *   Call the modified `GetTargetWindows` with the `filterByCurrentVD` parameter set to `true`.
+    *   Remove its own redundant window gathering and filtering loop, relying on `GetTargetWindows` instead.
+
+This approach centralizes the window filtering logic (including virtual desktop awareness) in `GetTargetWindows`, making it easier to apply this behavior to other functions in the future if needed, simply by having them call `GetTargetWindows` with the new parameter.
+
+Here are the code changes:
+
+```autohotkey:Move and Resize Hotkeys.ahk
+// ... existing code ...
+#SingleInstance force
+Persistent
+SetBatchLines, -1
+ListLines, Off
+DetectHiddenWindows, On ; Make this persistent for the script
+CoordMode, Pixel, Screen
+CoordMode, Mouse, Screen
+CoordMode, Menu, Screen
+SendMode, Input ; Recommended for new scripts for speed and reliability.
+SetWorkingDir, %A_ScriptDir% ; Ensures a consistent starting directory.
+
+; --- Virtual Desktop Functions ---
+global __VDM_MANAGER := "" ; Global variable to store the Virtual Desktop Manager COM object
+
+_InitVDM() {
+    global __VDM_MANAGER
+    if (IsObject(__VDM_MANAGER)) ; Check if it's already a valid COM object
+        return __VDM_MANAGER
+    try {
+        ; CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
+        ; IID_IVirtualDesktopManager = {A5CD92FF-29BE-454C-8D04-D82879FB3F1B}
+        __VDM_MANAGER := ComObjCreate("{AA509086-5CA9-4C25-8F95-589D3C07B48A}", "{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}")
+    } catch e {
+        OutputDebug, Failed to initialize Virtual Desktop Manager: % e.Message ? e.Message : "Unknown error"
+        __VDM_MANAGER := "" ; Reset on failure to ensure it's not a stale/invalid object
+    }
+    return __VDM_MANAGER
+}
+
+VD_IsWindowOnCurrentDesktop(hWnd) {
+    local ivdm := _InitVDM()
+    if (!IsObject(ivdm)) {
+        ; Fallback: if VDM fails to initialize, assume all windows are "current"
+        ; This prevents breaking functionality if COM VDM isn't available or fails.
+        return true 
+    }
+    try {
+        isOnCurrentDesktop := ivdm.IsWindowOnCurrentVirtualDesktop(hWnd)
+        return isOnCurrentDesktop
+    } catch e {
+        OutputDebug, VD_IsWindowOnCurrentDesktop Error for hWnd %hWnd%: % e.Message ? e.Message : "Unknown error"
+        ; Fallback on error for a specific window check: assume it is on current desktop
+        ; to avoid incorrectly excluding it due to a transient COM error.
+        return true 
+    }
+}
+; --- End Virtual Desktop Functions ---
+
+global IniFiles := ["ShortcutDefs-AltWin.ini", "ShortcutDefs-CtrlWin.ini", "ShortcutDefs-Custom.ini"]
+global HotkeySettingsFile := "HotkeySettings.ini"
+// ... existing code ...
+RunNextPrevInstance(action) {
+    DetectHiddenWindows, On
+    WinGet, List, List, ahk_class AutoHotkeyGUI
+    Found := false
+// ... existing code ...
+}
+
+
+; Function to get a list of target windows based on various criteria
+GetTargetWindows(mode := "all", specificMonitor := "", excludeMinimized := true, filterByCurrentVD := false) {
+    local windows, id, i, hwnd, title, class, exStyle, style, isMinimized, monitorNum
+    windows := []
+    DetectHiddenWindows, On ; Ensure this is on for reliable window detection
+    WinGet, id, List,,, Program Manager ; Get all top-level windows
+
+    Loop, %id%
+    {
+        hwnd := id%A_Index%
+
+        if (filterByCurrentVD) {
+            if (!VD_IsWindowOnCurrentDesktop(hwnd)) {
+                continue ; Skip if not on current virtual desktop
+            }
+        }
+        
+        WinGetTitle, title, ahk_id %hwnd%
+        WinGetClass, class, ahk_id %hwnd%
+        WinGet, exStyle, ExStyle, ahk_id %hwnd%
+        WinGet, style, Style, ahk_id %hwnd%
+        WinGet, isMinimized, MinMax, ahk_id %hwnd%
+
+        ; Consolidated and enhanced filtering for "normal application windows"
+        if (!IsWindowVisible(hwnd)) ; Must be visible (WS_VISIBLE)
+            continue
+        if (exStyle & 0x80) ; Skip tool windows (WS_EX_TOOLWINDOW)
+            continue
+        if (exStyle & 0x88) ; Skip tool windows that are also topmost (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
+            continue
+        if (style & 0x80000000) ; Skip disabled windows (WS_DISABLED)
+            continue
+        
+        ; Skip windows with no title unless they are specific known classes that can be legitimate main windows without titles
+        if (title = "" && class != "ZPContentViewWndClass" && class != "SunAwtFrame" && class != "SunAwtCanvas")
+             continue 
+        
+        ; Skip system/shell windows by class
+        if RegExMatch(class, "Progman|WorkerW|Shell_TrayWnd|NotifyIconOverflowWindow|WindowsDashboard|InputApp|SearchPane|StartMenuExperienceHost|Microsoft.Windows.Search|Button|Shell_Dialog")
+            continue
+        
+        ; Skip system/shell windows by title
+        if RegExMatch(title, "Action center|Microsoft Text Input Application|Program Manager")
+            continue
+        
+        ; Skip empty UWP host windows
+        if (class = "ApplicationFrameWindow" && title = "")
+            continue
+
+        ; Skip minimized windows if requested
+        if (excludeMinimized && isMinimized = -1)
+            continue
+            
+        ; Filter by specific monitor if requested
+        if (specificMonitor != "") {
+            WinGet, monitorNum, Monitor, ahk_id %hwnd%
+            if (monitorNum != specificMonitor)
+                continue
+        }
+        
+        windows.Push(hwnd)
+    }
+    return windows
+}
+
+IsWindowVisible(hwnd) {
+    WinGet, style, Style, ahk_id %hwnd%
+    return (style & 0x10000000) ; WS_VISIBLE
+}
+
+IsFullscreen(hwnd) {
+// ... existing code ...
+CascadeWindows_Function(customParams="") {
+    global MonitorCount, PrimaryMonitor, MonitorPrimary, WorkArea, TaskbarHeight, Margin, PaddingBetweenWindows, MaximizeOverTaskbar
+    
+    ; Get windows on current virtual desktop, including minimized ones (excludeMinimized = false)
+    windowsToCascade := GetTargetWindows("all", "", false, true) 
+
+    if (windowsToCascade.Length() = 0) {
+        ToolTip("No windows to cascade on current desktop.")
+        SetTimer, RemoveToolTip, -1000
+        return
+    }
+
+    numWindows := windowsToCascade.Length()
+    
+    currentMonitor := GetCurrentMonitor()
+    monLeft := WorkArea[currentMonitor].Left + Margin
+    monTop := WorkArea[currentMonitor].Top + Margin
+    monRight := WorkArea[currentMonitor].Right - Margin
+    monBottom := WorkArea[currentMonitor].Bottom - Margin
+    
+    monWidth := monRight - monLeft
+    monHeight := monBottom - monTop
+
+    titleBarHeight := 30 ; Approximate title bar height
+    cascadeOffsetX := titleBarHeight
+    cascadeOffsetY := titleBarHeight
+
+    ; Determine the initial size of the windows
+    ; Make them large enough but ensure they can cascade without going off-screen too quickly
+    winWidth := monWidth - (numWindows -1) * cascadeOffsetX
+    winHeight := monHeight - (numWindows -1) * cascadeOffsetY
+    
+    minWidth := monWidth / 2 ; Minimum reasonable width
+    minHeight := monHeight / 2 ; Minimum reasonable height
+    
+    winWidth := Max(winWidth, minWidth)
+    winHeight := Max(winHeight, minHeight)
+
+    Loop, % numWindows
+    {
+        hwnd := windowsToCascade[A_Index]
+        
+        WinGet, MinMax, MinMax, ahk_id %hwnd%
+        if (MinMax = 1) ; If maximized, restore it first
+            WinRestore, ahk_id %hwnd%
+        else if (MinMax = -1) ; If minimized, restore it
+            WinRestore, ahk_id %hwnd%
+
+        ; Calculate position for the current window
+        currentX := monLeft + (A_Index - 1) * cascadeOffsetX
+        currentY := monTop + (A_Index - 1) * cascadeOffsetY
+        
+        WinMove, ahk_id %hwnd%,, currentX, currentY, winWidth, winHeight
+        WinActivate, ahk_id %hwnd% ; Activate to bring to front in cascade order
+        Sleep, 50 ; Small delay to help with visual ordering and prevent restoration issues
+    }
+    
+    ; Activate the last window processed (which should be the "topmost" in the cascade)
+    if (numWindows > 0) {
+        WinActivate, ahk_id %windowsToCascade[numWindows]%
+    }
+}
+
+TileWindows(mode) { ; mode can be "horizontal" or "vertical"
+// ... existing code ...
+```
+
+**Explanation of Changes:**
+
+1.  **Virtual Desktop Functions (`_InitVDM`, `VD_IsWindowOnCurrentDesktop`)**:
+    *   These are placed near the top of the script.
+    *   `_InitVDM` handles the creation of the `IVirtualDesktopManager` COM object. It stores the object in a global variable `__VDM_MANAGER` to avoid re-creating it unnecessarily. Includes error handling.
+    *   `VD_IsWindowOnCurrentDesktop(hWnd)` uses the COM object to check if the window `hWnd` is on the active virtual desktop. It includes error handling and fallbacks (if COM fails, it assumes the window *is* on the current desktop to avoid incorrectly filtering it out).
+
+2.  **`GetTargetWindows` Function**:
+    *   A new optional parameter `filterByCurrentVD` (defaulting to `false`) is added.
+    *   If `filterByCurrentVD` is true, it calls `VD_IsWindowOnCurrentDesktop(hwnd)` for each window and skips it if it's not on the current virtual desktop.
+    *   The general filtering logic within `GetTargetWindows` has been made more comprehensive by incorporating filters that were previously only in `CascadeWindows_Function` (like skipping disabled windows, specific system titles/classes, and empty UWP frames). This makes `GetTargetWindows` a more reliable function for getting a list of "normal, interactive application windows."
+
+3.  **`CascadeWindows_Function`**:
+    *   It now calls `windowsToCascade := GetTargetWindows("all", "", false, true)`.
+        *   `"all"`: Gets all windows (not just from a specific monitor).
+        *   `""`: No specific monitor override.
+        *   `false`: `excludeMinimized` is false, so minimized windows are included (as cascading typically restores them).
+        *   `true`: `filterByCurrentVD` is true, so only windows on the current virtual desktop are considered.
+    *   The previous loop that manually gathered and filtered windows (`WinGet, id, List... Loop %id%...`) has been removed.
+    *   Added a `ToolTip` message if no windows are found to cascade.
+    *   The rest of the cascading logic (calculating positions, sizes, and moving windows) remains largely the same but now operates on the filtered `windowsToCascade` array.
+
+This should achieve the desired effect for `CascadeWindows`. If you want other functions (like `TileWindows`, `StackWindows_Function`, etc.) to also respect virtual desktops, you would similarly modify their calls to `GetTargetWindows` to pass `true` for the `filterByCurrentVD` parameter.
+
+---
+
+_**User**_
+
+Move and Resize Hotkeys.ahk
+
+Error at line 63.
+
+Line Text: Failed to initialize Virtual Desktop Manager: % e.Message ?
+e.Message : "Unknown error"
+Error: This parameter contains a variable name missing its ending
+percent sign.
+
+The program will exit.
+
+---
+
+_**Assistant**_
+
 
 
 ---
