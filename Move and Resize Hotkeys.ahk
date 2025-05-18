@@ -37,7 +37,56 @@ SetWorkingDir %A_ScriptDir%  ; Ensures a consistent starting directory.
 ; ==== Initialization Section ====
 ; ==============================================
 
-; #Persistent  ; Keep the script running until the user exits it.
+#SingleInstance force
+Persistent
+SetBatchLines, -1
+ListLines, Off
+DetectHiddenWindows, On ; Make this persistent for the script
+CoordMode, Pixel, Screen
+CoordMode, Mouse, Screen
+CoordMode, Menu, Screen
+SendMode, Input ; Recommended for new scripts for speed and reliability.
+SetWorkingDir, %A_ScriptDir% ; Ensures a consistent starting directory.
+
+; --- Virtual Desktop Functions ---
+global __VDM_MANAGER := "" ; Global variable to store the Virtual Desktop Manager COM object
+
+_InitVDM() {
+    global __VDM_MANAGER
+    if (IsObject(__VDM_MANAGER)) ; Check if it's already a valid COM object
+        return __VDM_MANAGER
+    try {
+        ; CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
+        ; IID_IVirtualDesktopManager = {A5CD92FF-29BE-454C-8D04-D82879FB3F1B}
+        __VDM_MANAGER := ComObjCreate("{AA509086-5CA9-4C25-8F95-589D3C07B48A}", "{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}")
+    } catch e {
+        OutputDebug, Failed to initialize Virtual Desktop Manager: % e.Message ? e.Message : "Unknown error"
+        __VDM_MANAGER := "" ; Reset on failure to ensure it's not a stale/invalid object
+    }
+    return __VDM_MANAGER
+}
+
+VD_IsWindowOnCurrentDesktop(hWnd) {
+    local ivdm := _InitVDM()
+    if (!IsObject(ivdm)) {
+        ; Fallback: if VDM fails to initialize, assume all windows are "current"
+        ; This prevents breaking functionality if COM VDM isn't available or fails.
+        return true 
+    }
+    try {
+        isOnCurrentDesktop := ivdm.IsWindowOnCurrentVirtualDesktop(hWnd)
+        return isOnCurrentDesktop
+    } catch e {
+        OutputDebug, VD_IsWindowOnCurrentDesktop Error for hWnd %hWnd%: % e.Message ? e.Message : "Unknown error"
+        ; Fallback on error for a specific window check: assume it is on current desktop
+        ; to avoid incorrectly excluding it due to a transient COM error.
+        return true 
+    }
+}
+; --- End Virtual Desktop Functions ---
+
+global IniFiles := ["ShortcutDefs-AltWin.ini", "ShortcutDefs-CtrlWin.ini", "ShortcutDefs-Custom.ini"]
+global HotkeySettingsFile := "HotkeySettings.ini"
 
 ; ====== Define Global variables ======
 
@@ -831,3 +880,149 @@ GetCurrentColNum(WinNum, ColCount, ByRef bOnColEdge := false)
 
 ; Print the Euro symbol (€) when AltGr+5 is pressed (ie. RightAlt+5)
 >!5:: Send, €
+
+; Function to get a list of target windows based on various criteria
+GetTargetWindows(mode := "all", specificMonitor := "", excludeMinimized := true, filterByCurrentVD := false) {
+    local windows, id, i, hwnd, title, class, exStyle, style, isMinimized, monitorNum
+    windows := []
+    DetectHiddenWindows, On ; Ensure this is on for reliable window detection
+    WinGet, id, List,,, Program Manager ; Get all top-level windows
+
+    Loop, %id%
+    {
+        hwnd := id%A_Index%
+
+        if (filterByCurrentVD) {
+            if (!VD_IsWindowOnCurrentDesktop(hwnd)) {
+                continue ; Skip if not on current virtual desktop
+            }
+        }
+        
+        WinGetTitle, title, ahk_id %hwnd%
+        WinGetClass, class, ahk_id %hwnd%
+        WinGet, exStyle, ExStyle, ahk_id %hwnd%
+        WinGet, style, Style, ahk_id %hwnd%
+        WinGet, isMinimized, MinMax, ahk_id %hwnd%
+
+        ; Consolidated and enhanced filtering for "normal application windows"
+        if (!IsWindowVisible(hwnd)) ; Must be visible (WS_VISIBLE)
+            continue
+        if (exStyle & 0x80) ; Skip tool windows (WS_EX_TOOLWINDOW)
+            continue
+        if (exStyle & 0x88) ; Skip tool windows that are also topmost (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
+            continue
+        if (style & 0x80000000) ; Skip disabled windows (WS_DISABLED)
+            continue
+        
+        ; Skip windows with no title unless they are specific known classes that can be legitimate main windows without titles
+        if (title = "" && class != "ZPContentViewWndClass" && class != "SunAwtFrame" && class != "SunAwtCanvas")
+             continue 
+        
+        ; Skip system/shell windows by class
+        if RegExMatch(class, "Progman|WorkerW|Shell_TrayWnd|NotifyIconOverflowWindow|WindowsDashboard|InputApp|SearchPane|StartMenuExperienceHost|Microsoft.Windows.Search|Button|Shell_Dialog")
+            continue
+        
+        ; Skip system/shell windows by title
+        if RegExMatch(title, "Action center|Microsoft Text Input Application|Program Manager")
+            continue
+        
+        ; Skip empty UWP host windows
+        if (class = "ApplicationFrameWindow" && title = "")
+            continue
+
+        ; Skip minimized windows if requested
+        if (excludeMinimized && isMinimized = -1)
+            continue
+            
+        ; Filter by specific monitor if requested
+        if (specificMonitor != "") {
+            WinGet, monitorNum, Monitor, ahk_id %hwnd%
+            if (monitorNum != specificMonitor)
+                continue
+        }
+        
+        windows.Push(hwnd)
+    }
+    return windows
+}
+
+IsWindowVisible(hwnd) {
+    WinGet, style, Style, ahk_id %hwnd%
+    return (style & 0x10000000) ; WS_VISIBLE
+}
+
+IsFullscreen(hwnd) {
+    WinGet, style, Style, ahk_id %hwnd%
+    return (style & 0x10000000) ; WS_VISIBLE
+}
+
+CascadeWindows_Function(customParams="") {
+    global MonitorCount, PrimaryMonitor, MonitorPrimary, WorkArea, TaskbarHeight, Margin, PaddingBetweenWindows, MaximizeOverTaskbar
+    
+    ; Get windows on current virtual desktop, including minimized ones (excludeMinimized = false)
+    windowsToCascade := GetTargetWindows("all", "", false, true) 
+
+    if (windowsToCascade.Length() = 0) {
+        ToolTip("No windows to cascade on current desktop.")
+        SetTimer, RemoveToolTip, -1000
+        return
+    }
+
+    numWindows := windowsToCascade.Length()
+    
+    currentMonitor := GetCurrentMonitor()
+    monLeft := WorkArea[currentMonitor].Left + Margin
+    monTop := WorkArea[currentMonitor].Top + Margin
+    monRight := WorkArea[currentMonitor].Right - Margin
+    monBottom := WorkArea[currentMonitor].Bottom - Margin
+    
+    monWidth := monRight - monLeft
+    monHeight := monBottom - monTop
+
+    titleBarHeight := 30 ; Approximate title bar height
+    cascadeOffsetX := titleBarHeight
+    cascadeOffsetY := titleBarHeight
+
+    ; Determine the initial size of the windows
+    ; Make them large enough but ensure they can cascade without going off-screen too quickly
+    winWidth := monWidth - (numWindows -1) * cascadeOffsetX
+    winHeight := monHeight - (numWindows -1) * cascadeOffsetY
+    
+    minWidth := monWidth / 2 ; Minimum reasonable width
+    minHeight := monHeight / 2 ; Minimum reasonable height
+    
+    winWidth := Max(winWidth, minWidth)
+    winHeight := Max(winHeight, minHeight)
+
+    Loop, % numWindows
+    {
+        hwnd := windowsToCascade[A_Index]
+        
+        WinGet, MinMax, MinMax, ahk_id %hwnd%
+        if (MinMax = 1) ; If maximized, restore it first
+            WinRestore, ahk_id %hwnd%
+        else if (MinMax = -1) ; If minimized, restore it
+            WinRestore, ahk_id %hwnd%
+
+        ; Calculate position for the current window
+        currentX := monLeft + (A_Index - 1) * cascadeOffsetX
+        currentY := monTop + (A_Index - 1) * cascadeOffsetY
+        
+        WinMove, ahk_id %hwnd%,, currentX, currentY, winWidth, winHeight
+        WinActivate, ahk_id %hwnd% ; Activate to bring to front in cascade order
+        Sleep, 50 ; Small delay to help with visual ordering and prevent restoration issues
+    }
+    
+    ; Activate the last window processed (which should be the "topmost" in the cascade)
+    if (numWindows > 0) {
+        WinActivate, ahk_id %windowsToCascade[numWindows]%
+    }
+}
+
+TileWindows(mode) { ; mode can be "horizontal" or "vertical"
+    if (mode == "horizontal") {
+        DllCall( "TileWindows", uInt,0, Int,0, Int,0, Int,0, Int,0 )
+    } else if (mode == "vertical") {
+        DllCall( "TileWindows", uInt,0, Int,1, Int,0, Int,0, Int,0 )
+    }
+}

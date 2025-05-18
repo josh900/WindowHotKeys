@@ -3,3 +3,5 @@
 
 # Packaging files (Advanced Installer)
 /Packaging/MoveAndResizeHotkeys-cache/
+# SpecStory explanation file
+.specstory/.what-is-this.md
